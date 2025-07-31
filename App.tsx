@@ -1,493 +1,1131 @@
-import React, { useEffect, useRef, useState } from 'react';
+import React, {useEffect, useRef, useState} from 'react';
 import {
-  View, Text, StyleSheet, ScrollView, Image, Modal, TouchableOpacity, Dimensions, StatusBar, Platform,
+  View,
+  Text,
+  StyleSheet,
+  Image,
+  Modal,
+  TouchableOpacity,
+  Dimensions,
+  StatusBar,
+  ActivityIndicator,
+  FlatList,
+  Animated,
 } from 'react-native';
-import { Camera, useCameraDevices } from 'react-native-vision-camera';
-import FaceDetection, { Face, FaceDetectionOptions } from '@react-native-ml-kit/face-detection';
-import { NativeModules } from 'react-native';
-import Svg, { Rect } from 'react-native-svg';
+import {Camera, useCameraDevices} from 'react-native-vision-camera';
+import FaceDetection, {
+  Face,
+  FaceDetectionOptions,
+} from '@react-native-ml-kit/face-detection';
+import {NativeModules} from 'react-native';
+import ReconnectingWebSocket from 'react-native-reconnecting-websocket';
+import RNFS from 'react-native-fs';
+import Sound from 'react-native-sound';
 
-const { FaceCropModule } = NativeModules;
-const BOUNDING_BOX_PADDING = 20; // Increased padding
+const {
+  ImageFlipModule,
+  ImageCropModule,
+  ImageRotateModule,
+  ImageCompressModule,
+} = NativeModules;
+const MIN_FACE_SIZE = 150;
+// Tingkatkan kualitas dan ukuran gambar
+const COMPRESSED_IMAGE_SIZE = 480; // Naikkan dari 320
+const COMPRESSED_IMAGE_QUALITY = 80; // Naikkan dari 60
+const PREVIEW_IMAGE_SIZE = 200; // Naikkan dari 100
+const PREVIEW_IMAGE_QUALITY = 80; // Naikkan dari 60
+// const COMPRESSED_IMAGE_SIZE = 320;
+// const COMPRESSED_IMAGE_QUALITY = 60;
+const DETECTION_INTERVAL = 100;
+const PROCESSING_COOLDOWN = 2000;
+// const PREVIEW_IMAGE_SIZE = 100;
+// const PREVIEW_IMAGE_QUALITY = 60;
 
-type ImageInfo = { path: string, width: number, height: number };
+type ImageInfo = {
+  path: string;
+  width: number;
+  height: number;
+};
+
+type CropPreview = {
+  id: string;
+  cropImage: string;
+  timestamp: number;
+  status: 'waiting' | 'recognized' | 'not_recognized';
+  personName?: string;
+  errorMessage?: string;
+};
+
+type DebugInfo = {
+  readTime?: number;
+  compressTime?: number;
+  rotateTime?: number;
+  flipTime?: number;
+  cropTime?: number;
+  compressTimeCrop?: number;
+  totalTime?: number;
+  originalSize?: number;
+  compressedSize?: number;
+  faceCount?: number;
+  compressionRatio?: number;
+  nativeProcessingTime?: number;
+};
+
+interface AutoFocusBoxProps {
+  x: number;
+  y: number;
+  size: number;
+  visible: boolean;
+}
+
+interface FaceDetectionBoxProps {
+  face: Face;
+  imageDisplayDims: {
+    width: number;
+    height: number;
+    x: number;
+    y: number;
+  };
+  imageInfo: ImageInfo;
+  index: number;
+}
+
+interface MemoizedCropPreviewItemProps {
+  crop: CropPreview;
+  onPress: (imagePath: string) => void;
+}
+
+const AutoFocusBox: React.FC<AutoFocusBoxProps> = ({x, y, size, visible}) => {
+  const scaleAnim = useRef(new Animated.Value(1.2)).current;
+  const opacityAnim = useRef(new Animated.Value(0)).current;
+
+  useEffect(() => {
+    if (visible) {
+      scaleAnim.setValue(1.2);
+      opacityAnim.setValue(1);
+
+      Animated.parallel([
+        Animated.timing(scaleAnim, {
+          toValue: 1,
+          duration: 200,
+          useNativeDriver: true,
+        }),
+        Animated.timing(opacityAnim, {
+          toValue: 0,
+          duration: 200,
+          delay: 1,
+          useNativeDriver: true,
+        }),
+      ]).start();
+    }
+  }, [visible, x, y]);
+
+  if (!visible) return null;
+
+  return (
+    <Animated.View
+      style={[
+        styles.autoFocusBox,
+        {
+          left: x - size / 2,
+          top: y - size / 2,
+          width: size,
+          height: size,
+          transform: [{scale: scaleAnim}],
+          opacity: opacityAnim,
+        },
+      ]}
+    />
+  );
+};
+
+const FaceDetectionBox: React.FC<FaceDetectionBoxProps> = ({
+  face,
+  imageDisplayDims,
+  imageInfo,
+  index,
+}) => {
+  const scaleX = imageDisplayDims.width / imageInfo.width;
+  const scaleY = imageDisplayDims.height / imageInfo.height;
+
+  const left = imageDisplayDims.x + face.frame.left * scaleX;
+  const top = imageDisplayDims.y + face.frame.top * scaleY;
+  const width = face.frame.width * scaleX;
+  const height = face.frame.height * scaleY;
+  const cornerLength = Math.min(width, height) * 0.2;
+
+  return (
+    <View
+      style={[
+        {
+          position: 'absolute',
+          left,
+          top,
+          width,
+          height,
+        },
+      ]}>
+      <View
+        style={[
+          styles.faceCorner,
+          styles.topLeft,
+          {width: cornerLength, height: cornerLength},
+        ]}
+      />
+      <View
+        style={[
+          styles.faceCorner,
+          styles.topRight,
+          {width: cornerLength, height: cornerLength},
+        ]}
+      />
+      <View
+        style={[
+          styles.faceCorner,
+          styles.bottomLeft,
+          {width: cornerLength, height: cornerLength},
+        ]}
+      />
+      <View
+        style={[
+          styles.faceCorner,
+          styles.bottomRight,
+          {width: cornerLength, height: cornerLength},
+        ]}
+      />
+
+      <View style={styles.faceNumberContainer}>
+        <Text style={styles.faceNumber}>{index + 1}</Text>
+      </View>
+    </View>
+  );
+};
+
+const MemoizedCropPreviewItem = React.memo(
+  ({crop, onPress}: MemoizedCropPreviewItemProps) => {
+    return (
+      <TouchableOpacity
+        style={[styles.cropPreviewItem, styles.cropPreviewRecognized]}
+        onPress={() => onPress(crop.cropImage)}>
+        <Image
+          source={{uri: `file://${crop.cropImage}`}}
+          style={styles.cropPreviewImage}
+          resizeMode='contain'
+        />
+
+        <View style={styles.cropPreviewStatus}>
+          {crop.status === 'recognized' && (
+            <Text style={styles.cropPreviewStatusText}>✅</Text>
+          )}
+          {crop.status === 'not_recognized' && (
+            <Text style={styles.cropPreviewStatusText}>❌</Text>
+          )}
+        </View>
+
+        {crop.personName && (
+          <Text style={styles.cropPreviewPersonName} numberOfLines={1}>
+            {crop.personName}
+          </Text>
+        )}
+
+        {crop.errorMessage && (
+          <Text style={styles.cropPreviewError} numberOfLines={1}>
+            {crop.errorMessage}
+          </Text>
+        )}
+
+        <Text style={styles.cropPreviewIndex}>#{crop.id.substring(5, 8)}</Text>
+      </TouchableOpacity>
+    );
+  },
+  (prevProps, nextProps) => {
+    return (
+      prevProps.crop.status === nextProps.crop.status &&
+      prevProps.crop.personName === nextProps.crop.personName &&
+      prevProps.crop.errorMessage === nextProps.crop.errorMessage
+    );
+  },
+);
 
 export default function App() {
   const [hasPermission, setHasPermission] = useState(false);
-  const [isProcessing, setIsProcessing] = useState(false);
   const [faceCount, setFaceCount] = useState(0);
-  const [croppedFaces, setCroppedFaces] = useState<string[]>([]);
   const [showFullscreen, setShowFullscreen] = useState(false);
   const [fullscreenImage, setFullscreenImage] = useState<string | null>(null);
-  const [detectedFaces, setDetectedFaces] = useState<Face[]>([]);
-  const [actualImageWidth, setActualImageWidth] = useState(0);
-  const [actualImageHeight, setActualImageHeight] = useState(0);
-  const [imageDisplayDimensions, setImageDisplayDimensions] = useState({ width: 0, height: 0, x: 0, y: 0 });
-  
-  // Image format options
-  const [outputFormat, setOutputFormat] = useState<'JPEG' | 'PNG' | 'WEBP'>('JPEG');
-  const [imageQuality, setImageQuality] = useState(95);
-
-  // State untuk kontrol auto-detection
+  const [isProcessing, setIsProcessing] = useState(false);
+  const [autoFocus, setAutoFocus] = useState({
+    visible: false,
+    x: 0,
+    y: 0,
+    timestamp: 0,
+  });
+  const [displayFaces, setDisplayFaces] = useState<Face[]>([]);
+  const [displayImageInfo, setDisplayImageInfo] = useState<ImageInfo | null>(
+    null,
+  );
+  const [imageDisplayDims, setImageDisplayDims] = useState<{
+    width: number;
+    height: number;
+    x: number;
+    y: number;
+  } | null>(null);
+  const [wsConnection, setWsConnection] =
+    useState<ReconnectingWebSocket | null>(null);
+  const [wsStatus, setWsStatus] = useState<
+    'disconnected' | 'connecting' | 'connected'
+  >('disconnected');
+  const [cropPreviews, setCropPreviews] = useState<CropPreview[]>([]);
+  const [recognitionStatus, setRecognitionStatus] = useState<{
+    status: 'idle' | 'processing' | 'recognized' | 'not_recognized';
+    personName?: string;
+    errorMessage?: string;
+  }>({status: 'idle'});
   const [shouldAutoDetect, setShouldAutoDetect] = useState(true);
-  const [lastDetectedImage, setLastDetectedImage] = useState<ImageInfo | null>(null);
-  const [lastBoundingBoxes, setLastBoundingBoxes] = useState<Face[]>([]);
-  const [cropTriggered, setCropTriggered] = useState(false);
+  const [isWaitingForResponse, setIsWaitingForResponse] = useState(false);
+  const [isShowingResult, setIsShowingResult] = useState(false);
+  const [allowProcessing, setAllowProcessing] = useState(true);
+  const [debugInfo, setDebugInfo] = useState<DebugInfo>({});
 
+  const detectionIntervalRef = useRef<NodeJS.Timeout | null>(null);
+  const resultTimeoutRef = useRef<NodeJS.Timeout | null>(null);
+  const isDetectionRunningRef = useRef<boolean>(false);
+  const autoFocusTimeoutRef = useRef<NodeJS.Timeout | null>(null);
+  const continuousDetectionRef = useRef<NodeJS.Timeout | null>(null);
+  const lastDetectionRef = useRef<number>(0);
+  const lastProcessingRef = useRef<number>(0);
+  const wsSendTimeRef = useRef<number>(0);
+
+  const lastFaceDetectionResult = useRef<{
+    faces: Face[];
+    imageInfo: ImageInfo;
+    timestamp: number;
+  } | null>(null);
+
+  const okaySound = useRef<Sound | null>(null);
+  const tidakTerdaftarSound = useRef<Sound | null>(null);
   const cameraRef = useRef<Camera>(null);
   const devices = useCameraDevices();
-  const device = devices.find((d) => d.position === 'front') ?? devices.find((d) => d.position === 'back');
+  const device =
+    devices.find(d => d.position === 'front') ??
+    devices.find(d => d.position === 'back');
+
+  const onPreviewPress = (imagePath: string) => {
+    setFullscreenImage(imagePath);
+    setShowFullscreen(true);
+  };
+
+  useEffect(() => {
+    Sound.setCategory('Playback');
+
+    okaySound.current = new Sound('okay.wav', Sound.MAIN_BUNDLE, error => {
+      if (error) console.log('Failed to load okay.wav', error);
+      else console.log('okay.wav loaded');
+    });
+
+    tidakTerdaftarSound.current = new Sound(
+      'tidak_terdaftar.wav',
+      Sound.MAIN_BUNDLE,
+      error => {
+        if (error) console.log('Failed to load tidak_terdaftar.wav', error);
+        else console.log('tidak_terdaftar.wav loaded');
+      },
+    );
+
+    return () => {
+      okaySound.current?.release();
+      tidakTerdaftarSound.current?.release();
+    };
+  }, []);
+
+  const playAudio = (soundType: 'okay' | 'tidak_terdaftar') => {
+    const sound =
+      soundType === 'okay' ? okaySound.current : tidakTerdaftarSound.current;
+
+    if (!sound) {
+      console.log(`⚠️ ${soundType} sound not initialized`);
+      return;
+    }
+
+    sound.play(success => {
+      if (success) console.log(`✅ ${soundType} played`);
+      else console.log(`❌ Failed to play ${soundType}`);
+    });
+  };
+
+  const resetAndResumeDetection = () => {
+    console.log('🔄 Resetting all states and resuming detection...');
+
+    if (resultTimeoutRef.current) clearTimeout(resultTimeoutRef.current);
+
+    setRecognitionStatus({status: 'idle'});
+    setIsShowingResult(false);
+    setAllowProcessing(true);
+    setIsProcessing(false);
+    setIsWaitingForResponse(false);
+    setShouldAutoDetect(true);
+
+    isDetectionRunningRef.current = false;
+  };
+
+  const triggerAutoFocus = async (x: number, y: number) => {
+    if (!cameraRef.current) return;
+
+    try {
+      await cameraRef.current.focus({x, y});
+
+      setAutoFocus({
+        visible: true,
+        x,
+        y,
+        timestamp: Date.now(),
+      });
+
+      if (autoFocusTimeoutRef.current) {
+        clearTimeout(autoFocusTimeoutRef.current);
+      }
+
+      autoFocusTimeoutRef.current = setTimeout(() => {
+        setAutoFocus(prev => ({...prev, visible: false}));
+      }, 1000);
+    } catch (error) {
+      console.log('Auto focus error:', error);
+    }
+  };
+
+  const handleScreenTap = (event: any) => {
+    if (showFullscreen) return;
+
+    const {locationX, locationY} = event.nativeEvent;
+    triggerAutoFocus(locationX, locationY);
+  };
+
+  const autoFocusOnFace = async (faces: Face[]) => {
+    if (!imageDisplayDims || !displayImageInfo || faces.length === 0) return;
+
+    const largestFace = faces.reduce((prev, curr) => {
+      return curr.frame.width * curr.frame.height >
+        prev.frame.width * prev.frame.height
+        ? curr
+        : prev;
+    });
+
+    const scaleX = imageDisplayDims.width / displayImageInfo.width;
+    const scaleY = imageDisplayDims.height / displayImageInfo.height;
+
+    const faceCenterX =
+      imageDisplayDims.x +
+      (largestFace.frame.left + largestFace.frame.width / 2) * scaleX;
+    const faceCenterY =
+      imageDisplayDims.y +
+      (largestFace.frame.top + largestFace.frame.height / 2) * scaleY;
+
+    await triggerAutoFocus(faceCenterX, faceCenterY);
+  };
+
+  useEffect(() => {
+    const ws = new ReconnectingWebSocket('wss://nvr.icode.id/nvidia/', [], {
+      reconnectInterval: 2000,
+      maxReconnectInterval: 5000,
+      reconnectDecay: 1.2,
+      timeoutInterval: 3000,
+      maxReconnectAttempts: 5,
+    });
+
+    ws.onopen = () => {
+      console.log('WebSocket connected');
+      setWsStatus('connected');
+    };
+
+    ws.onclose = () => {
+      console.log('WebSocket disconnected');
+      setWsStatus('disconnected');
+    };
+
+    ws.onerror = (error: any) => {
+      console.log('WebSocket error:', error);
+      setWsStatus('disconnected');
+    };
+
+    ws.onmessage = (message: {data: string}) => {
+      const receiveTime = Date.now();
+      const networkTime = receiveTime - wsSendTimeRef.current;
+      console.log(`⏱️ WS Network Time: ${networkTime}ms`);
+
+      try {
+        const data = JSON.parse(message.data);
+        console.log('📋 WebSocket response:', data);
+
+        if (data.type === 'check_person' || data.name) {
+          const personName = data.name;
+          console.log('👤 Person detected:', personName);
+
+          setIsWaitingForResponse(false);
+          setIsProcessing(false);
+          setIsShowingResult(true);
+
+          // Handle different recognition results
+          const isUnknownDone2 = personName === 'Unknown_done2';
+          const isUnknownDone = personName === 'Unknown_done';
+          const isRecognized = !isUnknownDone && !isUnknownDone2;
+
+          let status: 'recognized' | 'not_recognized' = 'not_recognized';
+          let errorMessage = '';
+
+          if (isUnknownDone2) {
+            // Special case with error message from server
+            errorMessage =
+              data.return_result?.error ||
+              'Wajah tidak dikenali (Unknown_done2)';
+          } else if (isUnknownDone) {
+            // Standard unrecognized face
+            errorMessage = 'Wajah tidak terdaftar';
+          }
+
+          // Update crop previews
+          setCropPreviews(prev => {
+            const updatedCrops = [...prev];
+            const pendingCropIndex = updatedCrops.findIndex(
+              crop => crop.status === 'waiting',
+            );
+
+            if (pendingCropIndex !== -1) {
+              updatedCrops[pendingCropIndex] = {
+                ...updatedCrops[pendingCropIndex],
+                status: isRecognized ? 'recognized' : 'not_recognized',
+                personName: isRecognized ? personName : undefined,
+                errorMessage: isRecognized ? undefined : errorMessage,
+              };
+            }
+
+            return updatedCrops;
+          });
+
+          // Update recognition status
+          setRecognitionStatus({
+            status: isRecognized ? 'recognized' : 'not_recognized',
+            personName: isRecognized ? personName : undefined,
+            errorMessage: isRecognized ? undefined : errorMessage,
+          });
+
+          // Play audio based on result
+          setTimeout(() => {
+            if (isRecognized) {
+              playAudio('okay');
+            } else if (isUnknownDone) {
+              // Hanya untuk Unknown_done
+              playAudio('tidak_terdaftar');
+            }
+
+            // Reset after audio playback
+            setTimeout(
+              () => {
+                resetAndResumeDetection();
+              },
+              isRecognized ? 1500 : 500,
+            );
+          }, 300);
+        }
+      } catch (error) {
+        console.error('Error parsing WebSocket message:', error);
+        resetAndResumeDetection();
+      }
+    };
+
+    setWsConnection(ws);
+    return () => {
+      // Keep WebSocket alive
+    };
+  }, []);
 
   useEffect(() => {
     (async () => {
-      const status = await Camera.requestCameraPermission();
-      setHasPermission(status === 'granted');
+      try {
+        const status = await Camera.requestCameraPermission();
+        setHasPermission(status === 'granted');
+
+        if (status === 'granted') {
+          try {
+            await Camera.requestMicrophonePermission();
+          } catch (micError) {
+            console.log('Microphone permission not needed:', micError);
+          }
+        }
+      } catch (error) {
+        console.error('Permission error:', error);
+        setHasPermission(false);
+      }
     })();
   }, []);
 
-  // Fungsi untuk menghitung dimensi display yang akurat
-  const calculateImageDisplayDimensions = (imgWidth: number, imgHeight: number) => {
-    const screenW = Dimensions.get('window').width;
-    const screenH = Dimensions.get('window').height - (Platform.OS === 'android' ? StatusBar.currentHeight || 0 : 0);
-    
-    const imageRatio = imgWidth / imgHeight;
-    const screenRatio = screenW / screenH;
+  useEffect(() => {
+    if (hasPermission && device && shouldAutoDetect && !showFullscreen) {
+      const startContinuousDetection = () => {
+        const detectContinuously = () => {
+          if (
+            shouldAutoDetect &&
+            !showFullscreen &&
+            !isDetectionRunningRef.current
+          ) {
+            detectFacesOptimized();
+          }
+          continuousDetectionRef.current = setTimeout(
+            detectContinuously,
+            DETECTION_INTERVAL,
+          );
+        };
+        detectContinuously();
+      };
 
-    let displayWidth, displayHeight, offsetX = 0, offsetY = 0;
-    
-    if (imageRatio > screenRatio) {
-      // Image lebih lebar - fit to width
-      displayWidth = screenW;
-      displayHeight = screenW / imageRatio;
-      offsetY = (screenH - displayHeight) / 2;
-    } else {
-      // Image lebih tinggi - fit to height
-      displayHeight = screenH;
-      displayWidth = screenH * imageRatio;
-      offsetX = (screenW - displayWidth) / 2;
+      startContinuousDetection();
+
+      return () => {
+        if (continuousDetectionRef.current) {
+          clearTimeout(continuousDetectionRef.current);
+        }
+      };
+    }
+  }, [hasPermission, device, shouldAutoDetect, showFullscreen]);
+
+  useEffect(() => {
+    return () => {
+      if (resultTimeoutRef.current) clearTimeout(resultTimeoutRef.current);
+      if (autoFocusTimeoutRef.current)
+        clearTimeout(autoFocusTimeoutRef.current);
+      if (continuousDetectionRef.current)
+        clearTimeout(continuousDetectionRef.current);
+    };
+  }, []);
+
+  const detectFacesOptimized = async () => {
+    if (!cameraRef.current || isDetectionRunningRef.current || showFullscreen) {
+      return;
     }
 
-    return { width: displayWidth, height: displayHeight, x: offsetX, y: offsetY };
-  };
+    const currentTime = Date.now();
+    isDetectionRunningRef.current = true;
+    lastDetectionRef.current = currentTime;
 
-  // Deteksi wajah dengan kontrol yang lebih baik
-  const detectFace = async () => {
-    if (!cameraRef.current || isProcessing || !shouldAutoDetect) return;
-    
-    setIsProcessing(true);
-    setShouldAutoDetect(false);
-    
     try {
-      console.log('[DEBUG] Starting face detection...');
-      const photo = await cameraRef.current.takePhoto({ flash: 'off', enableShutterSound: false });
-      
-      let rotatedPath = photo.path;
-      let rotatedWidth = photo.width;
-      let rotatedHeight = photo.height;
-      
-      // Rotate image if needed dan dapatkan dimensi yang benar
-      try {
-        rotatedPath = await FaceCropModule.rotateImageIfNeeded(photo.path);
-        
-        // Wait untuk mendapatkan dimensi gambar yang sudah dirotate
-        const imageSize = await new Promise<{width: number, height: number}>((resolve, reject) => {
-          Image.getSize(
-            `file://${rotatedPath}`,
-            (width, height) => resolve({ width, height }),
-            (error) => {
-              console.warn('[WARN] Could not get rotated image size:', error);
-              resolve({ width: rotatedWidth, height: rotatedHeight });
-            }
-          );
-        });
-        
-        rotatedWidth = imageSize.width;
-        rotatedHeight = imageSize.height;
-        
-      } catch (rotationError) {
-        console.warn('[WARN] Image rotation failed:', rotationError);
-        rotatedPath = photo.path;
-      }
+      console.log('🔍 Starting optimized face detection...');
+      const photo = await cameraRef.current.takePhoto({
+        flash: 'off',
+        enableShutterSound: false,
+      });
 
-      console.log(`[DEBUG] Final image dimensions: ${rotatedWidth}x${rotatedHeight}`);
+      const imgInfo: ImageInfo = {
+        path: photo.path,
+        width: photo.height,
+        height: photo.width,
+      };
 
-      // Set image info dengan dimensi yang benar
-      setFullscreenImage(`file://${rotatedPath}`);
-      setActualImageWidth(rotatedWidth);
-      setActualImageHeight(rotatedHeight);
-      
-      // Calculate display dimensions
-      const displayDims = calculateImageDisplayDimensions(rotatedWidth, rotatedHeight);
-      setImageDisplayDimensions(displayDims);
+      setDisplayImageInfo(imgInfo);
 
-      // Face detection
       const options: FaceDetectionOptions = {
-        performanceMode: 'accurate',
+        performanceMode: 'fast',
         landmarkMode: 'none',
         contourMode: 'none',
         classificationMode: 'none',
-        minFaceSize: 0.1,
+        minFaceSize: 0.12,
       };
-      
-      const faces = await FaceDetection.detect(`file://${rotatedPath}`, options);
-      console.log(`[DEBUG] Detected ${faces.length} faces`);
-      
+
+      const faces = await FaceDetection.detect(`file://${photo.path}`, options);
+      console.log('👤 Faces detected:', faces.length);
+
+      lastFaceDetectionResult.current = {
+        faces,
+        imageInfo: imgInfo,
+        timestamp: currentTime,
+      };
+
+      const displayDims = calculateImageDisplayDimensions(
+        imgInfo.width,
+        imgInfo.height,
+      );
+
       setFaceCount(faces.length);
-      setDetectedFaces(faces);
+      setDisplayFaces(faces);
+      setImageDisplayDims(displayDims);
 
-      // Store for cropping dengan informasi yang benar
-      setLastDetectedImage({ path: rotatedPath, width: rotatedWidth, height: rotatedHeight });
-      setLastBoundingBoxes(faces);
-      setCropTriggered(false);
-      
-      // Show fullscreen
-      setShowFullscreen(true);
-
-      // Debug log yang lebih detail
-      console.log('[DEBUG] Image info:', {
-        path: rotatedPath,
-        actualSize: `${rotatedWidth}x${rotatedHeight}`,
-        displaySize: `${displayDims.width}x${displayDims.height}`,
-        offset: `${displayDims.x},${displayDims.y}`
-      });
-      
-      if (faces.length > 0) {
-        faces.forEach((f, i) => {
-          console.log(`[DEBUG] ML Kit Face[${i}]:`, {
-            frame: f.frame,
-            relative: {
-              left: f.frame.left / rotatedWidth,
-              top: f.frame.top / rotatedHeight,
-              width: f.frame.width / rotatedWidth,
-              height: f.frame.height / rotatedHeight
-            }
-          });
-        });
+      if (faces.length > 0 && currentTime - lastDetectionRef.current > 2000) {
+        autoFocusOnFace(faces);
       }
-      
+
+      if (
+        faces.length > 0 &&
+        allowProcessing &&
+        !isProcessing &&
+        !isWaitingForResponse &&
+        !isShowingResult
+      ) {
+        const hasValidFace = faces.some(face => {
+          const scaleX = displayDims.width / imgInfo.width;
+          const scaleY = displayDims.height / imgInfo.height;
+          const displayWidth = face.frame.width * scaleX;
+          const displayHeight = face.frame.height * scaleY;
+          return (
+            displayWidth >= MIN_FACE_SIZE && displayHeight >= MIN_FACE_SIZE
+          );
+        });
+
+        if (
+          hasValidFace &&
+          currentTime - lastProcessingRef.current > PROCESSING_COOLDOWN
+        ) {
+          console.log('✅ Valid face found, starting optimized processing...');
+          lastProcessingRef.current = currentTime;
+          processAndSendImageOptimized(imgInfo, faces);
+        }
+      }
     } catch (err) {
-      console.error('[ERROR] detectFace failed:', err);
-      setShouldAutoDetect(true);
+      console.error('❌ Face detection error:', err);
+    } finally {
+      isDetectionRunningRef.current = false;
+    }
+  };
+
+  const calculateImageDisplayDimensions = (
+    imgWidth: number,
+    imgHeight: number,
+  ) => {
+    const screenWidth = Dimensions.get('window').width;
+    const screenHeight = Dimensions.get('window').height;
+
+    const imageRatio = imgWidth / imgHeight;
+    const screenRatio = screenWidth / screenHeight;
+
+    let width,
+      height,
+      offsetX = 0,
+      offsetY = 0;
+
+    if (imageRatio > screenRatio) {
+      width = screenWidth;
+      height = screenWidth / imageRatio;
+      offsetY = (screenHeight - height) / 2;
+    } else {
+      height = screenHeight;
+      width = screenHeight * imageRatio;
+      offsetX = (screenWidth - width) / 2;
+    }
+
+    return {width, height, x: offsetX, y: offsetY};
+  };
+
+  const processAndSendImageOptimized = async (
+    imageInfo: ImageInfo,
+    faces: Face[],
+  ) => {
+    const processStartTime = Date.now();
+    let readTime = 0,
+      rotateTime = 0,
+      flipTime = 0,
+      cropTime = 0,
+      compressTime = 0,
+      totalTime = 0;
+    let originalBase64 = '',
+      rotatedBase64 = '',
+      flippedBase64 = '',
+      cropBase64 = '';
+    let base64ForWebSocket = '';
+
+    try {
+      setIsProcessing(true);
+      setAllowProcessing(false);
+      setRecognitionStatus({status: 'processing'});
+      setShouldAutoDetect(false);
+
+      // 1. Read file
+      const readStart = Date.now();
+      originalBase64 = await RNFS.readFile(imageInfo.path, 'base64');
+      readTime = Date.now() - readStart;
+
+      // 2. Rotate
+      const rotateStart = Date.now();
+      rotatedBase64 = await ImageRotateModule.rotateBase64Image(
+        originalBase64,
+        -90,
+      );
+      rotateTime = Date.now() - rotateStart;
+
+      // 3. Flip
+      const flipStart = Date.now();
+      flippedBase64 = await ImageFlipModule.flipBase64Image(
+        rotatedBase64,
+        'horizontal',
+      );
+      flipTime = Date.now() - flipStart;
+
+      // 4. Crop
+      cropBase64 = flippedBase64;
+      cropTime = 0;
+      if (faces.length > 0) {
+        const largestFace = faces.reduce((prev, curr) =>
+          curr.frame.width * curr.frame.height >
+          prev.frame.width * prev.frame.height
+            ? curr
+            : prev,
+        );
+        const cropStart = Date.now();
+        try {
+          cropBase64 = await ImageCropModule.cropFace(
+            flippedBase64,
+            Math.round(largestFace.frame.left),
+            Math.round(largestFace.frame.top),
+            Math.round(largestFace.frame.width),
+            Math.round(largestFace.frame.height),
+          );
+        } catch (e) {
+          cropBase64 = flippedBase64;
+          console.warn('Crop failed, fallback to flipped image', e);
+        }
+        cropTime = Date.now() - cropStart;
+      }
+
+      // 5. Compress for WebSocket
+      const compressStart = Date.now();
+      try {
+        const compressionResult = await ImageCompressModule.compressBase64Image(
+          cropBase64,
+          COMPRESSED_IMAGE_SIZE,
+          COMPRESSED_IMAGE_SIZE,
+          COMPRESSED_IMAGE_QUALITY,
+        );
+        base64ForWebSocket = compressionResult.base64;
+      } catch (e) {
+        base64ForWebSocket = cropBase64;
+        console.warn('Compression error, fallback to cropBase64', e);
+      }
+      compressTime = Date.now() - compressStart;
+
+      // 6. Create preview image (smaller and lower quality)
+      const previewCompressStart = Date.now();
+      let previewBase64 = base64ForWebSocket;
+      try {
+        const previewCompressionResult =
+          await ImageCompressModule.compressBase64Image(
+            cropBase64,
+            PREVIEW_IMAGE_SIZE,
+            PREVIEW_IMAGE_SIZE,
+            PREVIEW_IMAGE_QUALITY,
+            'cover', // Pastikan wajah terlihat penuh
+          );
+        previewBase64 = previewCompressionResult.base64;
+      } catch (e) {
+        console.warn('Preview compression failed, using WS image', e);
+      }
+
+      // 7. Save preview image to cache
+      const cropId = `crop_${Date.now()}_${Math.random()
+        .toString(36)
+        .substr(2, 9)}`;
+      const previewPath = `${RNFS.CachesDirectoryPath}/preview_${cropId}.jpg`;
+      await RNFS.writeFile(previewPath, previewBase64, 'base64');
+
+      const newCropPreview: CropPreview = {
+        id: cropId,
+        cropImage: previewPath,
+        timestamp: Date.now(),
+        status: 'waiting',
+      };
+
+      setCropPreviews(prev => [newCropPreview, ...prev].slice(0, 10));
+
+      // 8. Send to WebSocket
+      if (wsConnection && wsStatus === 'connected') {
+        setIsWaitingForResponse(true);
+        wsSendTimeRef.current = Date.now();
+        wsConnection.send(`11:check_image:${base64ForWebSocket}:11:11e`);
+      }
+
+      // 9. Total time & update debug info
+      totalTime = Date.now() - processStartTime;
+      setDebugInfo({
+        readTime,
+        rotateTime,
+        flipTime,
+        cropTime,
+        compressTime,
+        totalTime,
+        originalSize: originalBase64.length,
+        compressedSize: base64ForWebSocket.length,
+        faceCount: faces.length,
+      });
+    } catch (error) {
+      const errorMsg = error instanceof Error ? error.message : 'Unknown error';
+      console.error('Processing error:', errorMsg);
+
+      setRecognitionStatus({
+        status: 'not_recognized',
+        errorMessage: `Error: ${errorMsg}`,
+      });
+
+      setCropPreviews(prev => {
+        if (prev.length > 0 && prev[0].status === 'waiting') {
+          const updatedCrops = [...prev];
+          updatedCrops[0] = {
+            ...updatedCrops[0],
+            status: 'not_recognized',
+            errorMessage: `Error: ${errorMsg}`,
+          };
+          return updatedCrops;
+        }
+        return prev;
+      });
+
+      setTimeout(() => {
+        playAudio('tidak_terdaftar');
+        setTimeout(() => resetAndResumeDetection(), 500);
+      }, 300);
     } finally {
       setIsProcessing(false);
     }
   };
 
-  // Auto-crop dengan koordinat yang diperbaiki
+  // Clean up cache periodically
   useEffect(() => {
-    if (
-      showFullscreen &&
-      lastDetectedImage &&
-      lastBoundingBoxes.length > 0 &&
-      !cropTriggered &&
-      imageDisplayDimensions.width > 0
-    ) {
-      const timer = setTimeout(async () => {
-        console.log('[DEBUG] Starting auto-crop...');
-        const newCroppedFaces: string[] = [];
-        
-        for (const [idx, face] of lastBoundingBoxes.entries()) {
-          try {
-            // Gunakan koordinat asli dari ML Kit dengan validasi yang lebih ketat
-            const originalLeft = Math.max(0, face.frame.left);
-            const originalTop = Math.max(0, face.frame.top);
-            const originalWidth = Math.min(face.frame.width, lastDetectedImage.width - originalLeft);
-            const originalHeight = Math.min(face.frame.height, lastDetectedImage.height - originalTop);
-
-            // Apply padding dengan bounds checking yang lebih baik
-            const cropLeft = Math.max(0, Math.floor(originalLeft - BOUNDING_BOX_PADDING));
-            const cropTop = Math.max(0, Math.floor(originalTop - BOUNDING_BOX_PADDING));
-            
-            const maxCropWidth = lastDetectedImage.width - cropLeft;
-            const maxCropHeight = lastDetectedImage.height - cropTop;
-            
-            const cropWidth = Math.min(
-              maxCropWidth,
-              Math.floor(originalWidth + (BOUNDING_BOX_PADDING * 2))
-            );
-            const cropHeight = Math.min(
-              maxCropHeight,
-              Math.floor(originalHeight + (BOUNDING_BOX_PADDING * 2))
-            );
-
-            // Validasi final
-            if (cropWidth <= 0 || cropHeight <= 0) {
-              console.warn(`[WARN] Invalid crop dimensions for face ${idx}`);
-              continue;
+    const cleanupCache = async () => {
+      try {
+        const files = await RNFS.readDir(RNFS.CachesDirectoryPath);
+        const now = Date.now();
+        files.forEach(file => {
+          if (file.isFile() && file.name.startsWith('preview_')) {
+            const fileMtime = file.mtime ? file.mtime.valueOf() : now;
+            if (now - fileMtime > 1000 * 60 * 60) {
+              RNFS.unlink(file.path).catch(e =>
+                console.warn(`Failed to delete ${file.path}:`, e),
+              );
             }
-
-            console.log(`[DEBUG] Cropping Face[${idx}]:`, {
-              mlKit: { 
-                left: face.frame.left, 
-                top: face.frame.top, 
-                width: face.frame.width, 
-                height: face.frame.height 
-              },
-              normalized: { left: originalLeft, top: originalTop, width: originalWidth, height: originalHeight },
-              crop: { left: cropLeft, top: cropTop, width: cropWidth, height: cropHeight },
-              imageSize: { w: lastDetectedImage.width, h: lastDetectedImage.height },
-              imageActual: { w: actualImageWidth, h: actualImageHeight },
-              format: outputFormat,
-              quality: imageQuality
-            });
-            
-            const base64 = await FaceCropModule.cropImage(
-              lastDetectedImage.path, 
-              cropLeft, 
-              cropTop, 
-              cropWidth, 
-              cropHeight,
-              outputFormat,
-              imageQuality
-            );
-            
-            if (base64 && base64.length > 100) {
-              newCroppedFaces.push(base64);
-              console.log(`[DEBUG] Successfully cropped face ${idx}, format: ${outputFormat}, base64 length: ${base64}`);
-            } else {
-              console.warn(`[WARN] Invalid base64 for face ${idx}, length: ${base64?.length || 0}`);
-            }
-          } catch (err) {
-            console.error(`[ERROR] Cropping face ${idx} failed:`, err);
           }
-        }
-        
-        if (newCroppedFaces.length > 0) {
-          setCroppedFaces((prev) => {
-            const combined = [...newCroppedFaces, ...prev];
-            return combined.slice(0, 10);
-          });
-          console.log(`[DEBUG] Added ${newCroppedFaces.length} cropped faces`);
-        } else {
-          console.warn('[WARN] No faces were successfully cropped');
-        }
-        
-        setCropTriggered(true);
-      }, 1500); // Increased delay
+        });
+      } catch (e) {
+        console.warn('Failed to clean cache:', e);
+      }
+    };
 
-      return () => clearTimeout(timer);
+    const interval = setInterval(cleanupCache, 1000 * 60 * 30);
+    cleanupCache();
+
+    return () => clearInterval(interval);
+  }, []);
+
+  const renderFaceBoxes = () => {
+    if (
+      !imageDisplayDims ||
+      !displayImageInfo ||
+      displayFaces.length === 0 ||
+      showFullscreen
+    ) {
+      return null;
     }
-  }, [showFullscreen, lastDetectedImage, lastBoundingBoxes, cropTriggered, imageDisplayDimensions, actualImageWidth, actualImageHeight]);
 
-  // Close fullscreen dan kembali ke kamera
+    return (
+      <View style={StyleSheet.absoluteFill} pointerEvents="none">
+        {displayFaces.map((face, index) => (
+          <FaceDetectionBox
+            key={`${face.frame.left}-${face.frame.top}-${index}`}
+            face={face}
+            imageDisplayDims={imageDisplayDims}
+            imageInfo={displayImageInfo}
+            index={index}
+          />
+        ))}
+      </View>
+    );
+  };
+
   const closeFullscreen = () => {
-    console.log('[DEBUG] Closing fullscreen...');
     setShowFullscreen(false);
     setFullscreenImage(null);
-    setDetectedFaces([]);
-    
-    // Reset dan enable detection lagi setelah delay
-    setTimeout(() => {
-      setShouldAutoDetect(true);
-      setIsProcessing(false);
-    }, 500);
-  };
-
-  // Manual detection trigger
-  const manualDetect = () => {
-    if (!isProcessing) {
-      setShouldAutoDetect(true);
-      detectFace();
-    }
-  };
-
-  // Auto-detection trigger
-  useEffect(() => {
-    if (hasPermission && device && shouldAutoDetect && !showFullscreen && !isProcessing) {
-      const timer = setTimeout(() => {
-        detectFace();
-      }, 1000);
-
-      return () => clearTimeout(timer);
-    }
-  }, [hasPermission, device, shouldAutoDetect, showFullscreen]);
-
-  // Helper untuk menghitung koordinat display bounding box yang akurat
-  const getDisplayCoordinates = (face: Face) => {
-    if (!actualImageWidth || !actualImageHeight || imageDisplayDimensions.width === 0) return null;
-    
-    const scaleX = imageDisplayDimensions.width / actualImageWidth;
-    const scaleY = imageDisplayDimensions.height / actualImageHeight;
-
-    // Gunakan koordinat asli dari ML Kit
-    const boxLeft = (face.frame.left * scaleX) + imageDisplayDimensions.x - (BOUNDING_BOX_PADDING * scaleX);
-    const boxTop = (face.frame.top * scaleY) + imageDisplayDimensions.y - (BOUNDING_BOX_PADDING * scaleY);
-    const boxWidth = (face.frame.width * scaleX) + (BOUNDING_BOX_PADDING * 2 * scaleX);
-    const boxHeight = (face.frame.height * scaleY) + (BOUNDING_BOX_PADDING * 2 * scaleY);
-
-    // Ensure bounding box doesn't go outside screen bounds
-    const finalBoxLeft = Math.max(imageDisplayDimensions.x, boxLeft);
-    const finalBoxTop = Math.max(imageDisplayDimensions.y, boxTop);
-    const finalBoxWidth = Math.min(boxWidth, imageDisplayDimensions.width - (finalBoxLeft - imageDisplayDimensions.x));
-    const finalBoxHeight = Math.min(boxHeight, imageDisplayDimensions.height - (finalBoxTop - imageDisplayDimensions.y));
-
-    return { 
-      boxLeft: finalBoxLeft, 
-      boxTop: finalBoxTop, 
-      boxWidth: finalBoxWidth, 
-      boxHeight: finalBoxHeight 
-    };
   };
 
   if (!device || !hasPermission) {
     return (
       <View style={styles.center}>
         <Text style={styles.loadingText}>Loading Camera...</Text>
+        <Text style={styles.subLoadingText}>Optimized for Android 11+</Text>
       </View>
     );
   }
 
+  const shouldShowDetectionOverlay =
+    faceCount === 0 &&
+    recognitionStatus.status === 'idle' &&
+    !showFullscreen &&
+    !isWaitingForResponse &&
+    !isShowingResult &&
+    !isProcessing;
+
+  const recognizedCrops = cropPreviews.filter(
+    crop => crop.status === 'recognized',
+  );
+
   return (
     <View style={styles.container}>
       <StatusBar translucent backgroundColor="transparent" />
-      
-      {/* Camera View */}
-      <Camera
-        ref={cameraRef}
+
+      <TouchableOpacity
         style={StyleSheet.absoluteFill}
-        device={device}
-        isActive={!showFullscreen}
-        photo={true}
+        activeOpacity={1}
+        onPress={handleScreenTap}>
+        <Camera
+          ref={cameraRef}
+          style={showFullscreen ? styles.hiddenCamera : StyleSheet.absoluteFill}
+          device={device}
+          isActive={true}
+          photo={true}
+          resizeMode="contain"
+          enableZoomGesture={false}
+          enableFpsGraph={false}
+          lowLightBoost={false}
+        />
+      </TouchableOpacity>
+
+      <AutoFocusBox
+        x={autoFocus.x}
+        y={autoFocus.y}
+        size={60}
+        visible={autoFocus.visible}
       />
 
-      {/* Status Overlay */}
-      <View style={styles.statusOverlay}>
-        <Text style={styles.statusText}>
-          {isProcessing ? 'Processing...' : `Faces: ${faceCount}`}
-        </Text>
-        {!showFullscreen && (
-          <TouchableOpacity style={styles.detectButton} onPress={manualDetect}>
-            <Text style={styles.detectButtonText}>Detect Faces</Text>
-          </TouchableOpacity>
-        )}
-      </View>
+      {renderFaceBoxes()}
 
-      {/* Cropped Faces Container */}
-      {croppedFaces.length > 0 && (
-        <ScrollView horizontal style={styles.croppedFacesContainer} showsHorizontalScrollIndicator={false}>
-          {croppedFaces.map((base64, index) => (
-            <Image
-              key={`face-${index}`}
-              source={{ uri: `data:image/${outputFormat.toLowerCase()};base64,${base64}` }}
-              style={styles.croppedFace}
-            />
-          ))}
-        </ScrollView>
+      {shouldShowDetectionOverlay && (
+        <View style={styles.loadingOverlay}>
+          <ActivityIndicator size="large" color="#00ff00" />
+          <Text style={styles.loadingText}>Mendeteksi wajah...</Text>
+          <Text style={styles.optimizedText}>⚡ Mode Optimized</Text>
+          <Text style={styles.wsStatus}>
+            WebSocket:{' '}
+            {wsStatus === 'connected'
+              ? '✅ Connected'
+              : wsStatus === 'connecting'
+              ? '🔄 Connecting'
+              : '❌ Disconnected'}
+          </Text>
+        </View>
       )}
 
-      {/* Fullscreen Modal */}
+      {(isWaitingForResponse || isProcessing) && (
+        <View style={styles.processingOverlay}>
+          <ActivityIndicator size="small" color="white" />
+          <Text style={styles.processingText}>
+            {isWaitingForResponse
+              ? '⏳ Menunggu hasil...'
+              : '⚡ Memproses cepat...'}
+          </Text>
+        </View>
+      )}
+
+      {(recognitionStatus.status === 'recognized' ||
+        recognitionStatus.status === 'not_recognized') && (
+        <View
+          style={[
+            styles.recognitionResultOverlay,
+            recognitionStatus.status === 'recognized' &&
+              styles.recognizedStatus,
+            recognitionStatus.status === 'not_recognized' &&
+              styles.notRecognizedStatus,
+          ]}>
+          {recognitionStatus.status === 'recognized' ? (
+            <>
+              <Text style={styles.recognitionStatusText}>
+                ✅ Wajah Dikenali
+              </Text>
+              <Text style={styles.recognitionPersonName}>
+                {recognitionStatus.personName}
+              </Text>
+            </>
+          ) : (
+            <>
+              <Text style={styles.recognitionStatusText}>
+                ❌ Wajah Tidak Dikenali
+              </Text>
+              {recognitionStatus.errorMessage && (
+                <Text style={styles.recognitionErrorText}>
+                  {recognitionStatus.errorMessage}
+                </Text>
+              )}
+            </>
+          )}
+        </View>
+      )}
+
+      <View style={styles.debugOverlay}>
+        <Text style={styles.debugTitle}>⚡ Optimized Timings</Text>
+
+        {debugInfo.readTime !== undefined && (
+          <Text style={styles.debugText}>Read: {debugInfo.readTime}ms</Text>
+        )}
+        {debugInfo.compressTime !== undefined && (
+          <Text style={styles.debugText}>
+            Compress: {debugInfo.compressTime}ms
+          </Text>
+        )}
+        {debugInfo.rotateTime !== undefined && (
+          <Text style={styles.debugText}>Rotate: {debugInfo.rotateTime}ms</Text>
+        )}
+        {debugInfo.flipTime !== undefined && (
+          <Text style={styles.debugText}>Flip: {debugInfo.flipTime}ms</Text>
+        )}
+        {debugInfo.cropTime !== undefined && (
+          <Text style={styles.debugText}>Crop: {debugInfo.cropTime}ms</Text>
+        )}
+        {debugInfo.totalTime !== undefined && (
+          <Text style={[styles.debugText, styles.totalTimeText]}>
+            Total: {debugInfo.totalTime}ms
+          </Text>
+        )}
+        {debugInfo.compressedSize !== undefined && (
+          <Text style={styles.debugText}>
+            Size: {Math.round(debugInfo.compressedSize / 1024)}KB
+          </Text>
+        )}
+        {debugInfo.faceCount !== undefined && (
+          <Text style={styles.debugText}>Faces: {debugInfo.faceCount}</Text>
+        )}
+        <Text style={styles.optimizedLabel}>🚀 Android 11+ Ready</Text>
+      </View>
+
+      {recognizedCrops.length > 0 && (
+        <View style={styles.cropPreviewContainer}>
+          <Text style={styles.cropPreviewTitle}>Recognition Results</Text>
+          <FlatList
+            horizontal
+            data={recognizedCrops}
+            keyExtractor={item => item.id}
+            renderItem={({item}) => (
+              <MemoizedCropPreviewItem crop={item} onPress={onPreviewPress} />
+            )}
+            contentContainerStyle={styles.cropPreviewScroll}
+            initialNumToRender={3}
+            maxToRenderPerBatch={3}
+            windowSize={5}
+            removeClippedSubviews
+          />
+        </View>
+      )}
+
       <Modal
         visible={showFullscreen}
         animationType="slide"
         transparent={false}
-        statusBarTranslucent
-      >
+        statusBarTranslucent>
         <View style={styles.fullscreenContainer}>
           {fullscreenImage && (
-            <View style={styles.fullscreenImageContainer}>
+            <>
               <Image
-                source={{ uri: fullscreenImage }}
-                style={styles.fullscreenImage}
+                source={{uri: `file://${fullscreenImage}`}}
+                style={styles.fullscreenImageSimple}
                 resizeMode="contain"
               />
-              
-              {/* Bounding Box Overlay */}
-              {imageDisplayDimensions.width > 0 && (
-                <View style={StyleSheet.absoluteFill} pointerEvents="none">
-                  <Svg width="100%" height="100%">
-                    {detectedFaces.map((face, index) => {
-                      const coords = getDisplayCoordinates(face);
-                      if (!coords) return null;
-                      
-                      const { boxLeft, boxTop, boxWidth, boxHeight } = coords;
-                      
-                      return (
-                        <Rect
-                          key={index}
-                          x={boxLeft}
-                          y={boxTop}
-                          width={boxWidth}
-                          height={boxHeight}
-                          stroke="lime"
-                          strokeWidth={3}
-                          fill="transparent"
-                        />
-                      );
-                    })}
-                  </Svg>
-                </View>
-              )}
-              
-              {/* Debug Info Overlay */}
-              {__DEV__ && (
-                <View style={styles.debugOverlay}>
-                  <Text style={styles.debugText}>
-                    Actual: {actualImageWidth}x{actualImageHeight}
-                  </Text>
-                  <Text style={styles.debugText}>
-                    Display: {Math.round(imageDisplayDimensions.width)}x{Math.round(imageDisplayDimensions.height)}
-                  </Text>
-                  <Text style={styles.debugText}>
-                    Offset: {Math.round(imageDisplayDimensions.x)}, {Math.round(imageDisplayDimensions.y)}
-                  </Text>
-                </View>
-              )}
-              
-              {/* Format Selection Controls */}
-              <View style={styles.formatControls}>
-                <Text style={styles.formatLabel}>Format:</Text>
-                <View style={styles.formatButtons}>
-                  {(['JPEG', 'PNG', 'WEBP'] as const).map((format) => (
-                    <TouchableOpacity
-                      key={format}
-                      style={[
-                        styles.formatButton,
-                        outputFormat === format && styles.formatButtonActive
-                      ]}
-                      onPress={() => setOutputFormat(format)}
-                    >
-                      <Text style={[
-                        styles.formatButtonText,
-                        outputFormat === format && styles.formatButtonTextActive
-                      ]}>
-                        {format}
-                      </Text>
-                    </TouchableOpacity>
-                  ))}
-                </View>
-                {outputFormat !== 'PNG' && (
-                  <View style={styles.qualityControl}>
-                    <Text style={styles.formatLabel}>Quality: {imageQuality}%</Text>
-                    <View style={styles.qualityButtons}>
-                      {[70, 85, 95, 100].map((quality) => (
-                        <TouchableOpacity
-                          key={quality}
-                          style={[
-                            styles.qualityButton,
-                            imageQuality === quality && styles.formatButtonActive
-                          ]}
-                          onPress={() => setImageQuality(quality)}
-                        >
-                          <Text style={[
-                            styles.qualityButtonText,
-                            imageQuality === quality && styles.formatButtonTextActive
-                          ]}>
-                            {quality}%
-                          </Text>
-                        </TouchableOpacity>
-                      ))}
-                    </View>
-                  </View>
-                )}
-              </View>
-              
-              {/* Close Button */}
               <View style={styles.buttonContainer}>
-                <TouchableOpacity style={styles.closeButton} onPress={closeFullscreen}>
-                  <Text style={styles.closeButtonText}>Kembali ke Kamera</Text>
+                <TouchableOpacity
+                  style={styles.closeButton}
+                  onPress={closeFullscreen}>
+                  <Text style={styles.closeButtonText}>🔙 Back</Text>
                 </TouchableOpacity>
               </View>
-            </View>
+            </>
           )}
         </View>
       </Modal>
@@ -496,95 +1134,297 @@ export default function App() {
 }
 
 const styles = StyleSheet.create({
-  container: { 
+  container: {
     flex: 1,
-    backgroundColor: 'black'
+    backgroundColor: 'black',
   },
-  center: { 
-    flex: 1, 
-    justifyContent: 'center', 
+  center: {
+    flex: 1,
+    justifyContent: 'center',
     alignItems: 'center',
-    backgroundColor: 'black'
+    backgroundColor: 'black',
   },
   loadingText: {
     color: 'white',
-    fontSize: 18
+    fontSize: 18,
+    marginTop: 20,
+    fontWeight: '600',
   },
-  statusOverlay: {
-    position: 'absolute',
-    bottom: 40,
-    alignSelf: 'center',
-    backgroundColor: 'rgba(0,0,0,0.8)',
-    padding: 15,
-    borderRadius: 10,
-    alignItems: 'center',
+  subLoadingText: {
+    color: '#00ff00',
+    fontSize: 14,
+    marginTop: 8,
+    fontStyle: 'italic',
   },
-  statusText: { 
-    color: 'white', 
-    fontSize: 16, 
+  optimizedText: {
+    color: '#00ff00',
+    fontSize: 14,
+    marginTop: 5,
     fontWeight: 'bold',
-    marginBottom: 10
   },
-  detectButton: {
-    backgroundColor: 'rgba(0, 255, 0, 0.8)',
-    paddingVertical: 8,
-    paddingHorizontal: 16,
-    borderRadius: 20,
+  optimizedLabel: {
+    color: '#00ff00',
+    fontSize: 10,
+    marginTop: 5,
+    fontWeight: 'bold',
+    textAlign: 'center',
   },
-  detectButtonText: {
+  wsStatus: {
     color: 'white',
     fontSize: 14,
-    fontWeight: 'bold'
+    marginTop: 10,
   },
-  croppedFacesContainer: {
+  hiddenCamera: {
+    width: 0,
+    height: 0,
+  },
+  autoFocusBox: {
     position: 'absolute',
-    bottom: 120,
+    borderWidth: 2,
+    borderColor: '#00ff00',
+    backgroundColor: 'transparent',
+    zIndex: 10,
+    borderRadius: 4,
+  },
+  faceCorner: {
+    position: 'absolute',
+    borderColor: '#00FF00',
+    backgroundColor: 'transparent',
+  },
+  topLeft: {
+    top: 0,
+    left: 0,
+    borderTopWidth: 3,
+    borderLeftWidth: 3,
+  },
+  topRight: {
+    top: 0,
+    right: 0,
+    borderTopWidth: 3,
+    borderRightWidth: 3,
+  },
+  bottomLeft: {
+    bottom: 0,
+    left: 0,
+    borderBottomWidth: 3,
+    borderLeftWidth: 3,
+  },
+  bottomRight: {
+    bottom: 0,
+    right: 0,
+    borderBottomWidth: 3,
+    borderRightWidth: 3,
+  },
+  faceNumberContainer: {
+    position: 'absolute',
+    top: -25,
+    left: 0,
+    backgroundColor: 'rgba(0, 255, 0, 0.9)',
+    paddingHorizontal: 8,
+    paddingVertical: 2,
+    borderRadius: 10,
+  },
+  faceNumber: {
+    color: 'white',
+    fontSize: 12,
+    fontWeight: 'bold',
+  },
+  loadingOverlay: {
+    position: 'absolute',
+    top: 0,
     left: 0,
     right: 0,
-    height: 110,
-    backgroundColor: 'rgba(0,0,0,0.6)',
-    paddingVertical: 5,
-    paddingHorizontal: 10,
+    bottom: 0,
+    justifyContent: 'center',
+    alignItems: 'center',
+    backgroundColor: 'rgba(0, 0, 0, 0.95)',
+    zIndex: 3,
   },
-  croppedFace: {
-    width: 100,
-    height: 100,
-    borderRadius: 10,
-    marginHorizontal: 5,
+  processingOverlay: {
+    position: 'absolute',
+    top: 50,
+    alignSelf: 'center',
+    backgroundColor: 'rgba(0,0,0,0.9)',
+    padding: 12,
+    borderRadius: 12,
+    alignItems: 'center',
+    flexDirection: 'row',
+    minWidth: 200,
+    zIndex: 10,
     borderWidth: 2,
-    borderColor: 'white',
+    borderColor: '#00ff00',
+  },
+  processingText: {
+    color: 'white',
+    fontSize: 14,
+    fontWeight: '600',
+    marginLeft: 8,
+  },
+  recognitionResultOverlay: {
+    position: 'absolute',
+    bottom: 200,
+    alignSelf: 'center',
+    backgroundColor: 'rgba(0,0,0,0.95)',
+    padding: 20,
+    borderRadius: 15,
+    alignItems: 'center',
+    minWidth: 250,
+    zIndex: 10,
+    borderWidth: 2,
+  },
+  recognizedStatus: {
+    borderColor: '#00ff00',
+    backgroundColor: 'rgba(0,255,0,0.85)',
+  },
+  notRecognizedStatus: {
+    borderColor: '#ff4444',
+    backgroundColor: 'rgba(255, 68, 68, 0.85)',
+  },
+  recognitionStatusText: {
+    color: 'white',
+    fontSize: 18,
+    fontWeight: 'bold',
+    marginTop: 8,
+    textAlign: 'center',
+  },
+  recognitionPersonName: {
+    color: '#ffffff',
+    fontSize: 16,
+    fontWeight: '600',
+    marginTop: 5,
+    textAlign: 'center',
+  },
+  recognitionErrorText: {
+    color: '#ffffff',
+    fontSize: 14,
+    marginTop: 5,
+    textAlign: 'center',
+  },
+  debugOverlay: {
+    position: 'absolute',
+    top: 50,
+    right: 10,
+    backgroundColor: 'rgba(0, 0, 0, 0.9)',
+    padding: 12,
+    borderRadius: 8,
+    zIndex: 100,
+    maxWidth: '65%',
+    borderWidth: 1,
+    borderColor: '#00ff00',
+  },
+  debugTitle: {
+    color: '#00ff00',
+    fontSize: 14,
+    fontWeight: 'bold',
+    marginBottom: 5,
+    textAlign: 'center',
+  },
+  debugText: {
+    color: 'white',
+    fontSize: 12,
+    lineHeight: 16,
+  },
+  totalTimeText: {
+    color: '#00ff00',
+    fontWeight: 'bold',
+    fontSize: 13,
+  },
+  cropPreviewContainer: {
+    position: 'absolute',
+    bottom: 20,
+    left: 10,
+    right: 10,
+    backgroundColor: 'rgba(0,0,0,0.9)',
+    borderRadius: 12,
+    padding: 12,
+    zIndex: 1,
+    borderWidth: 1,
+    borderColor: '#00ff00',
+  },
+  cropPreviewTitle: {
+    color: 'white',
+    fontSize: 16,
+    fontWeight: 'bold',
+    marginBottom: 10,
+    textAlign: 'center',
+  },
+  cropPreviewScroll: {
+    maxHeight: 120,
+  },
+  cropPreviewItem: {
+    marginRight: 12,
+    alignItems: 'center',
+    borderRadius: 8,
+    padding: 6,
+    borderWidth: 2,
+    borderColor: 'transparent',
+    backgroundColor: 'rgba(255,255,255,0.1)',
+    width: 100,
+  },
+  cropPreviewRecognized: {
+    borderColor: '#00ff00',
+    backgroundColor: 'rgba(0,255,0,0.1)',
+  },
+  cropPreviewImage: {
+    width: 120, // Naikkan dari 80
+    height: 120, // Naikkan dari 80
+    borderRadius: 6,
+    backgroundColor: 'rgba(255,255,255,0.1)',
+  },
+
+  cropPreviewStatus: {
+    position: 'absolute',
+    top: 2,
+    right: 2,
+    backgroundColor: 'rgba(0,0,0,0.8)',
+    borderRadius: 10,
+    width: 20,
+    height: 20,
+    justifyContent: 'center',
+    alignItems: 'center',
+  },
+  cropPreviewStatusText: {
+    fontSize: 12,
+    textAlign: 'center',
+  },
+  cropPreviewPersonName: {
+    color: '#00ff00',
+    fontSize: 10,
+    fontWeight: 'bold',
+    marginTop: 2,
+    maxWidth: 90,
+    textAlign: 'center',
+  },
+  cropPreviewError: {
+    color: '#ff5555',
+    fontSize: 9,
+    marginTop: 2,
+    textAlign: 'center',
+    maxWidth: 90,
+  },
+  cropPreviewIndex: {
+    color: 'white',
+    fontSize: 10,
+    marginTop: 2,
+    textAlign: 'center',
   },
   fullscreenContainer: {
     flex: 1,
     backgroundColor: 'black',
   },
-  fullscreenImageContainer: {
+  fullscreenImageSimple: {
     flex: 1,
-    position: 'relative',
-    justifyContent: 'center',
-    alignItems: 'center',
-  },
-  fullscreenImage: {
     width: '100%',
     height: '100%',
-  },
-  debugOverlay: {
-    position: 'absolute',
-    top: 50,
-    left: 10,
-    backgroundColor: 'rgba(0,0,0,0.7)',
-    padding: 10,
-    borderRadius: 5,
-  },
-  debugText: {
-    color: 'white',
-    fontSize: 12,
-    fontFamily: 'monospace',
   },
   buttonContainer: {
     position: 'absolute',
     bottom: 50,
     alignSelf: 'center',
+    flexDirection: 'row',
+    gap: 10,
+    flexWrap: 'wrap',
+    justifyContent: 'center',
   },
   closeButton: {
     backgroundColor: 'rgba(255, 255, 255, 0.9)',
@@ -595,63 +1435,6 @@ const styles = StyleSheet.create({
   closeButtonText: {
     color: 'black',
     fontSize: 16,
-    fontWeight: 'bold',
-  },
-  formatControls: {
-    position: 'absolute',
-    top: 50,
-    right: 10,
-    backgroundColor: 'rgba(0,0,0,0.8)',
-    padding: 15,
-    borderRadius: 10,
-    minWidth: 150,
-  },
-  formatLabel: {
-    color: 'white',
-    fontSize: 14,
-    fontWeight: 'bold',
-    marginBottom: 8,
-  },
-  formatButtons: {
-    flexDirection: 'row',
-    marginBottom: 10,
-  },
-  formatButton: {
-    backgroundColor: 'rgba(255,255,255,0.2)',
-    paddingVertical: 6,
-    paddingHorizontal: 10,
-    borderRadius: 5,
-    marginRight: 5,
-  },
-  formatButtonActive: {
-    backgroundColor: 'rgba(0,255,0,0.8)',
-  },
-  formatButtonText: {
-    color: 'white',
-    fontSize: 12,
-    fontWeight: 'bold',
-  },
-  formatButtonTextActive: {
-    color: 'black',
-  },
-  qualityControl: {
-    marginTop: 5,
-  },
-  qualityButtons: {
-    flexDirection: 'row',
-    flexWrap: 'wrap',
-  },
-  qualityButton: {
-    backgroundColor: 'rgba(255,255,255,0.2)',
-    paddingVertical: 4,
-    paddingHorizontal: 8,
-    borderRadius: 5,
-    marginRight: 5,
-    marginBottom: 5,
-  },
-  qualityButtonText: {
-    color: 'white',
-    fontSize: 11,
     fontWeight: 'bold',
   },
 });

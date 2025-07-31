@@ -20,7 +20,10 @@ class MainApplication : Application(), ReactApplication {
             PackageList(this).packages.apply {
               // Packages that cannot be autolinked yet can be added manually here, for example:
               // add(MyReactNativePackage())
-              add(FaceCropPackage())
+              add(ImageFlipPackage())
+              add(ImageCropPackage())
+              add(ImageRotatePackage())
+              add(ImageCompressPackage())
             }
 
         override fun getJSMainModuleName(): String = "index"
