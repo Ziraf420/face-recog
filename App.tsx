@@ -13,6 +13,7 @@ import {
   Animated,
 } from 'react-native';
 import {Camera, useCameraDevices} from 'react-native-vision-camera';
+// ImageResizer
 import FaceDetection, {
   Face,
   FaceDetectionOptions,
@@ -21,6 +22,7 @@ import {NativeModules} from 'react-native';
 import ReconnectingWebSocket from 'react-native-reconnecting-websocket';
 import RNFS from 'react-native-fs';
 import Sound from 'react-native-sound';
+import ImageResizer from 'react-native-image-resizer';
 
 const {
   ImageFlipModule,
@@ -28,18 +30,19 @@ const {
   ImageRotateModule,
   ImageCompressModule,
 } = NativeModules;
-const MIN_FACE_SIZE = 150;
+
+// Enhanced constants for better face detection box
+const MIN_FACE_SIZE = 120; // Turunkan untuk lebih sensitif
+const FACE_BOX_PADDING = 20; // Padding untuk box yang lebih besar
+const CORNER_LENGTH_RATIO = 0.25; // Corner lebih besar
+
 // Tingkatkan kualitas dan ukuran gambar
-const COMPRESSED_IMAGE_SIZE = 480; // Naikkan dari 320
-const COMPRESSED_IMAGE_QUALITY = 80; // Naikkan dari 60
-const PREVIEW_IMAGE_SIZE = 200; // Naikkan dari 100
-const PREVIEW_IMAGE_QUALITY = 80; // Naikkan dari 60
-// const COMPRESSED_IMAGE_SIZE = 320;
-// const COMPRESSED_IMAGE_QUALITY = 60;
-const DETECTION_INTERVAL = 100;
+const COMPRESSED_IMAGE_SIZE = 480;
+const COMPRESSED_IMAGE_QUALITY = 80;
+const PREVIEW_IMAGE_SIZE = 200;
+const PREVIEW_IMAGE_QUALITY = 80;
+const DETECTION_INTERVAL = 50; // Reduced from 100ms to 50ms for faster detection
 const PROCESSING_COOLDOWN = 2000;
-// const PREVIEW_IMAGE_SIZE = 100;
-// const PREVIEW_IMAGE_QUALITY = 60;
 
 type ImageInfo = {
   path: string;
@@ -69,6 +72,11 @@ type DebugInfo = {
   faceCount?: number;
   compressionRatio?: number;
   nativeProcessingTime?: number;
+  detectionTime?: number; // Added detection time
+  captureTime?: number; // Added capture time
+  wsTime?: number; // Added WebSocket time
+  wsResponseTime?: number; // Added WebSocket response time
+  grandTotalTime?: number; // Added grand total time from detection to WS response
 };
 
 interface AutoFocusBoxProps {
@@ -139,6 +147,7 @@ const AutoFocusBox: React.FC<AutoFocusBoxProps> = ({x, y, size, visible}) => {
   );
 };
 
+// Fixed FaceDetectionBox without pulsing animation and smoother rendering
 const FaceDetectionBox: React.FC<FaceDetectionBoxProps> = ({
   face,
   imageDisplayDims,
@@ -148,11 +157,15 @@ const FaceDetectionBox: React.FC<FaceDetectionBoxProps> = ({
   const scaleX = imageDisplayDims.width / imageInfo.width;
   const scaleY = imageDisplayDims.height / imageInfo.height;
 
-  const left = imageDisplayDims.x + face.frame.left * scaleX;
-  const top = imageDisplayDims.y + face.frame.top * scaleY;
-  const width = face.frame.width * scaleX;
-  const height = face.frame.height * scaleY;
-  const cornerLength = Math.min(width, height) * 0.2;
+  // Add padding for bigger box
+  const left =
+    imageDisplayDims.x + (face.frame.left - FACE_BOX_PADDING) * scaleX;
+  const top = imageDisplayDims.y + (face.frame.top - FACE_BOX_PADDING) * scaleY;
+  const width = (face.frame.width + FACE_BOX_PADDING * 2) * scaleX;
+  const height = (face.frame.height + FACE_BOX_PADDING * 2) * scaleY;
+  const cornerLength = Math.min(width, height) * CORNER_LENGTH_RATIO;
+
+  // REMOVED: Pulsing animation for smoother performance
 
   return (
     <View
@@ -165,6 +178,7 @@ const FaceDetectionBox: React.FC<FaceDetectionBoxProps> = ({
           height,
         },
       ]}>
+      {/* Static corner indicators - no animation */}
       <View
         style={[
           styles.faceCorner,
@@ -194,8 +208,19 @@ const FaceDetectionBox: React.FC<FaceDetectionBoxProps> = ({
         ]}
       />
 
+      {/* Center border for clearer outline */}
+      <View style={styles.faceCenterBorder} />
+
+      {/* Enhanced face number container */}
       <View style={styles.faceNumberContainer}>
         <Text style={styles.faceNumber}>{index + 1}</Text>
+      </View>
+
+      {/* Face size indicator */}
+      <View style={styles.faceSizeIndicator}>
+        <Text style={styles.faceSizeText}>
+          {Math.round(face.frame.width)}x{Math.round(face.frame.height)}
+        </Text>
       </View>
     </View>
   );
@@ -210,7 +235,7 @@ const MemoizedCropPreviewItem = React.memo(
         <Image
           source={{uri: `file://${crop.cropImage}`}}
           style={styles.cropPreviewImage}
-          resizeMode='contain'
+          resizeMode="contain"
         />
 
         <View style={styles.cropPreviewStatus}>
@@ -284,6 +309,7 @@ export default function App() {
   const [isWaitingForResponse, setIsWaitingForResponse] = useState(false);
   const [isShowingResult, setIsShowingResult] = useState(false);
   const [allowProcessing, setAllowProcessing] = useState(true);
+  const [grandTotalTime, setGrandTotalTime] = useState<number>(0);
   const [debugInfo, setDebugInfo] = useState<DebugInfo>({});
 
   const detectionIntervalRef = useRef<NodeJS.Timeout | null>(null);
@@ -312,6 +338,24 @@ export default function App() {
   const onPreviewPress = (imagePath: string) => {
     setFullscreenImage(imagePath);
     setShowFullscreen(true);
+  };
+
+  // Enhanced face validation with padding consideration
+  const hasValidFaceEnhanced = (
+    faces: Face[],
+    displayDims: any,
+    imgInfo: ImageInfo,
+  ) => {
+    return faces.some(face => {
+      const scaleX = displayDims.width / imgInfo.width;
+      const scaleY = displayDims.height / imgInfo.height;
+
+      // Calculate size with padding
+      const displayWidth = (face.frame.width + FACE_BOX_PADDING * 2) * scaleX;
+      const displayHeight = (face.frame.height + FACE_BOX_PADDING * 2) * scaleY;
+
+      return displayWidth >= MIN_FACE_SIZE && displayHeight >= MIN_FACE_SIZE;
+    });
   };
 
   useEffect(() => {
@@ -448,8 +492,18 @@ export default function App() {
 
     ws.onmessage = (message: {data: string}) => {
       const receiveTime = Date.now();
-      const networkTime = receiveTime - wsSendTimeRef.current;
-      console.log(`⏱️ WS Network Time: ${networkTime}ms`);
+      const wsResponseTime = receiveTime - wsSendTimeRef.current;
+      // const grandTotalTime = receiveTime - grandTotalStartTime;
+
+      console.log(`⏱️ WS Response Time: ${wsResponseTime}ms`);
+      // console.log(`🎯 GRAND TOTAL TIME: ${grandTotalTime}ms (Detection → WS Response)`);
+
+      // Update debug info with response times
+      setDebugInfo(prev => ({
+        ...prev,
+        wsResponseTime,
+        // grandTotalTime,
+      }));
 
       try {
         const data = JSON.parse(message.data);
@@ -463,7 +517,6 @@ export default function App() {
           setIsProcessing(false);
           setIsShowingResult(true);
 
-          // Handle different recognition results
           const isUnknownDone2 = personName === 'Unknown_done2';
           const isUnknownDone = personName === 'Unknown_done';
           const isRecognized = !isUnknownDone && !isUnknownDone2;
@@ -472,16 +525,13 @@ export default function App() {
           let errorMessage = '';
 
           if (isUnknownDone2) {
-            // Special case with error message from server
             errorMessage =
               data.return_result?.error ||
               'Wajah tidak dikenali (Unknown_done2)';
           } else if (isUnknownDone) {
-            // Standard unrecognized face
             errorMessage = 'Wajah tidak terdaftar';
           }
 
-          // Update crop previews
           setCropPreviews(prev => {
             const updatedCrops = [...prev];
             const pendingCropIndex = updatedCrops.findIndex(
@@ -500,23 +550,19 @@ export default function App() {
             return updatedCrops;
           });
 
-          // Update recognition status
           setRecognitionStatus({
             status: isRecognized ? 'recognized' : 'not_recognized',
             personName: isRecognized ? personName : undefined,
             errorMessage: isRecognized ? undefined : errorMessage,
           });
 
-          // Play audio based on result
           setTimeout(() => {
             if (isRecognized) {
               playAudio('okay');
             } else if (isUnknownDone) {
-              // Hanya untuk Unknown_done
               playAudio('tidak_terdaftar');
             }
 
-            // Reset after audio playback
             setTimeout(
               () => {
                 resetAndResumeDetection();
@@ -601,35 +647,64 @@ export default function App() {
       return;
     }
 
+    const detectionStartTime = Date.now(); // Overall detection start time
     const currentTime = Date.now();
     isDetectionRunningRef.current = true;
     lastDetectionRef.current = currentTime;
 
     try {
       console.log('🔍 Starting optimized face detection...');
+
+      // Time the camera capture with optimized settings
+      const captureStartTime = Date.now();
       const photo = await cameraRef.current.takePhoto({
         flash: 'off',
         enableShutterSound: false,
+        // qualityPrioritization: 'speed', // Prioritize speed over quality
       });
-
+      const captureTime = Date.now() - captureStartTime;
+      const resizestartTime = Date.now();
+      const rotatedImage = await ImageResizer.createResizedImage(
+        photo.path,
+        640,
+        480,
+        'JPEG',
+        80,
+        -90, // Nilai rotate degree, 90=rotate right, -90=rotate left
+      );
+      const resizetime = Date.now() - resizestartTime;
       const imgInfo: ImageInfo = {
-        path: photo.path,
-        width: photo.height,
-        height: photo.width,
+        path: rotatedImage.path,
+        width: rotatedImage.height,
+        height: rotatedImage.width,
       };
+      console.log(`📷 Image captured: ${rotatedImage.path}`);
+      console.log("base64",await RNFS.readFile(rotatedImage.path,'base64'))
 
       setDisplayImageInfo(imgInfo);
 
+      // Optimized face detection options for speed
       const options: FaceDetectionOptions = {
-        performanceMode: 'fast',
-        landmarkMode: 'none',
-        contourMode: 'none',
-        classificationMode: 'none',
-        minFaceSize: 0.12,
+        performanceMode: 'fast', // Already set, good
+        landmarkMode: 'none', // Skip landmarks for speed
+        contourMode: 'none', // Skip contours for speed
+        classificationMode: 'none', // Skip classification for speed
+        minFaceSize: 0.1, // Slightly increase to reduce false positives
       };
 
-      const faces = await FaceDetection.detect(`file://${photo.path}`, options);
-      console.log('👤 Faces detected:', faces.length);
+      // Time the actual face detection
+      const faceDetectionStartTime = Date.now();
+      const faces = await FaceDetection.detect(`file://${rotatedImage.path}`, options);
+      const faceDetectionTime = Date.now() - faceDetectionStartTime;
+      const totalDetectionTime = Date.now() - detectionStartTime; // Total time including capture
+
+      console.log(`📸 Camera capture: ${captureTime}ms`);
+      console.log(`🔍 Face detection: ${faceDetectionTime}ms`);
+      console.log(`⚡ Total detection: ${totalDetectionTime}ms`);
+      console.log(`🖼️ reziseimage di detectface: ${resizetime}ms`);
+      console.log(`👤 Faces detected: ${faces.length}`);
+
+      setGrandTotalTime(totalDetectionTime + captureTime + totalDetectionTime);
 
       lastFaceDetectionResult.current = {
         faces,
@@ -642,13 +717,29 @@ export default function App() {
         imgInfo.height,
       );
 
+      // Update states immediately for no delay
       setFaceCount(faces.length);
+      
       setDisplayFaces(faces);
       setImageDisplayDims(displayDims);
+
+      // Update debug info with separated times
+      setDebugInfo(prev => ({
+        ...prev,
+        captureTime,
+        detectionTime: totalDetectionTime,
+        faceCount: faces.length,
+      }));
 
       if (faces.length > 0 && currentTime - lastDetectionRef.current > 2000) {
         autoFocusOnFace(faces);
       }
+      console.log(`👁️ Face count: ${faces.length}`);
+      console.log ('time face detection:', currentTime-lastDetectionRef.current, 'ms');
+      console.log('allowProcessing:', allowProcessing);
+      console.log('isProcessing:', isProcessing);
+      console.log('isWaitingForResponse:', isWaitingForResponse);
+      console.log('isShowingResult:', isShowingResult);
 
       if (
         faces.length > 0 &&
@@ -657,22 +748,19 @@ export default function App() {
         !isWaitingForResponse &&
         !isShowingResult
       ) {
-        const hasValidFace = faces.some(face => {
-          const scaleX = displayDims.width / imgInfo.width;
-          const scaleY = displayDims.height / imgInfo.height;
-          const displayWidth = face.frame.width * scaleX;
-          const displayHeight = face.frame.height * scaleY;
-          return (
-            displayWidth >= MIN_FACE_SIZE && displayHeight >= MIN_FACE_SIZE
-          );
-        });
+        // Use enhanced face validation
+        const hasValidFace = hasValidFaceEnhanced(faces, displayDims, imgInfo);
 
         if (
           hasValidFace &&
           currentTime - lastProcessingRef.current > PROCESSING_COOLDOWN
         ) {
-          console.log('✅ Valid face found, starting optimized processing...');
+          console.log('✅ Valid face found with detection, processing...');
           lastProcessingRef.current = currentTime;
+
+          // Set grand total start time for complete process tracking
+          // setGrandTotalStartTime(totalDetectionTime);
+
           processAndSendImageOptimized(imgInfo, faces);
         }
       }
@@ -740,17 +828,17 @@ export default function App() {
       readTime = Date.now() - readStart;
 
       // 2. Rotate
-      const rotateStart = Date.now();
-      rotatedBase64 = await ImageRotateModule.rotateBase64Image(
-        originalBase64,
-        -90,
-      );
-      rotateTime = Date.now() - rotateStart;
+      // const rotateStart = Date.now();
+      // rotatedBase64 = await ImageRotateModule.rotateBase64Image(
+      //   originalBase64,
+      //   -90,
+      // );
+      // rotateTime = Date.now() - rotateStart;
 
       // 3. Flip
       const flipStart = Date.now();
       flippedBase64 = await ImageFlipModule.flipBase64Image(
-        rotatedBase64,
+        originalBase64,
         'horizontal',
       );
       flipTime = Date.now() - flipStart;
@@ -765,14 +853,22 @@ export default function App() {
             ? curr
             : prev,
         );
+
         const cropStart = Date.now();
         try {
+          // Tentukan tinggi yang diinginkan (contoh: 1.5x tinggi wajah)
+          const heightMultiplier = 1.5;
+          const desiredHeight = Math.round(
+            largestFace.frame.height * heightMultiplier,
+          );
+
           cropBase64 = await ImageCropModule.cropFace(
             flippedBase64,
             Math.round(largestFace.frame.left),
             Math.round(largestFace.frame.top),
             Math.round(largestFace.frame.width),
-            Math.round(largestFace.frame.height),
+            Math.round(largestFace.frame.height), // Tinggi asli
+            desiredHeight, // PARAMETER BARU: tinggi yang diinginkan
           );
         } catch (e) {
           cropBase64 = flippedBase64;
@@ -783,38 +879,39 @@ export default function App() {
 
       // 5. Compress for WebSocket
       const compressStart = Date.now();
-      try {
-        const compressionResult = await ImageCompressModule.compressBase64Image(
-          cropBase64,
-          COMPRESSED_IMAGE_SIZE,
-          COMPRESSED_IMAGE_SIZE,
-          COMPRESSED_IMAGE_QUALITY,
-        );
-        base64ForWebSocket = compressionResult.base64;
-      } catch (e) {
-        base64ForWebSocket = cropBase64;
-        console.warn('Compression error, fallback to cropBase64', e);
-      }
+      // try {
+      //   const compressionResult = await ImageCompressModule.compressBase64Image(
+      //     cropBase64,
+      //     COMPRESSED_IMAGE_SIZE,
+      //     COMPRESSED_IMAGE_SIZE,
+      //     COMPRESSED_IMAGE_QUALITY,
+      //   );
+      //   base64ForWebSocket = compressionResult.base64;
+      // } catch (e) {
+      //   base64ForWebSocket = cropBase64;
+      //   console.warn('Compression error, fallback to cropBase64', e);
+      // }
       compressTime = Date.now() - compressStart;
 
-      // 6. Create preview image (smaller and lower quality)
-      const previewCompressStart = Date.now();
-      let previewBase64 = base64ForWebSocket;
-      try {
-        const previewCompressionResult =
-          await ImageCompressModule.compressBase64Image(
-            cropBase64,
-            PREVIEW_IMAGE_SIZE,
-            PREVIEW_IMAGE_SIZE,
-            PREVIEW_IMAGE_QUALITY,
-            'cover', // Pastikan wajah terlihat penuh
-          );
-        previewBase64 = previewCompressionResult.base64;
-      } catch (e) {
-        console.warn('Preview compression failed, using WS image', e);
-      }
+      // 6. Create preview image
+      // const previewCompressStart = Date.now();
+      // console.log("base64",await RNFS.readFile(, 'base64'))
+      let previewBase64 = cropBase64;
+      let base64ForWebSocket = cropBase64
+      // try {
+      //   const previewCompressionResult =
+      //     await ImageCompressModule.compressBase64Image(
+      //       cropBase64,
+      //       PREVIEW_IMAGE_SIZE,
+      //       PREVIEW_IMAGE_SIZE,
+      //       PREVIEW_IMAGE_QUALITY,
+      //     );
+      //   previewBase64 = previewCompressionResult.base64;
+      // } catch (e) {
+      //   console.warn('Preview compression failed, using WS image', e);
+      // }
 
-      // 7. Save preview image to cache
+      // 7. Save preview image
       const cropId = `crop_${Date.now()}_${Math.random()
         .toString(36)
         .substr(2, 9)}`;
@@ -833,23 +930,35 @@ export default function App() {
       // 8. Send to WebSocket
       if (wsConnection && wsStatus === 'connected') {
         setIsWaitingForResponse(true);
-        wsSendTimeRef.current = Date.now();
+
+        const wsStartTime = Date.now();
+        wsSendTimeRef.current = wsStartTime;
         wsConnection.send(`11:check_image:${base64ForWebSocket}:11:11e`);
+        const wsTime = Date.now() - wsStartTime;
+
+        console.log(`📡 WebSocket send: ${wsTime}ms`);
+
+        // Update debug info with WS send time
+        setDebugInfo(prev => ({
+          ...prev,
+          wsTime,
+        }));
       }
 
-      // 9. Total time & update debug info
+      // 9. Update debug info
       totalTime = Date.now() - processStartTime;
-      setDebugInfo({
+      setDebugInfo(prev => ({
+        ...prev,
         readTime,
         rotateTime,
         flipTime,
         cropTime,
         compressTime,
         totalTime,
-        originalSize: originalBase64.length,
-        compressedSize: base64ForWebSocket.length,
+        // originalSize: originalBase64.length,
+        // compressedSize: base64ForWebSocket.length,
         faceCount: faces.length,
-      });
+      }));
     } catch (error) {
       const errorMsg = error instanceof Error ? error.message : 'Unknown error';
       console.error('Processing error:', errorMsg);
@@ -879,6 +988,11 @@ export default function App() {
     } finally {
       setIsProcessing(false);
     }
+    setGrandTotalTime(grandTotalTime + totalTime);
+    setDebugInfo(prev => ({
+      ...prev,
+      grandTotalTime,
+    }));
   };
 
   // Clean up cache periodically
@@ -942,7 +1056,7 @@ export default function App() {
     return (
       <View style={styles.center}>
         <Text style={styles.loadingText}>Loading Camera...</Text>
-        <Text style={styles.subLoadingText}>Optimized for Android 11+</Text>
+        <Text style={styles.subLoadingText}>Face Detection Ready</Text>
       </View>
     );
   }
@@ -958,6 +1072,8 @@ export default function App() {
   const recognizedCrops = cropPreviews.filter(
     crop => crop.status === 'recognized',
   );
+
+  // setGrandTotalTime=(wsresponetime + readtime + rotatetime + fliptime + croptime + compressTime);
 
   return (
     <View style={styles.container}>
@@ -977,6 +1093,12 @@ export default function App() {
           enableZoomGesture={false}
           enableFpsGraph={false}
           lowLightBoost={false}
+          format={device?.formats.find(
+            format =>
+              format.photoWidth <= 1920 && // Limit photo resolution for speed
+              format.photoHeight <= 1080 &&
+              format.maxFps >= 30,
+          )}
         />
       </TouchableOpacity>
 
@@ -993,7 +1115,7 @@ export default function App() {
         <View style={styles.loadingOverlay}>
           <ActivityIndicator size="large" color="#00ff00" />
           <Text style={styles.loadingText}>Mendeteksi wajah...</Text>
-          <Text style={styles.optimizedText}>⚡ Mode Optimized</Text>
+          <Text style={styles.optimizedText}>⚡Fast Detection Mode</Text>
           <Text style={styles.wsStatus}>
             WebSocket:{' '}
             {wsStatus === 'connected'
@@ -1011,7 +1133,7 @@ export default function App() {
           <Text style={styles.processingText}>
             {isWaitingForResponse
               ? '⏳ Menunggu hasil...'
-              : '⚡ Memproses cepat...'}
+              : '⚡ Memproses dengan Box...'}
           </Text>
         </View>
       )}
@@ -1051,15 +1173,20 @@ export default function App() {
       )}
 
       <View style={styles.debugOverlay}>
-        <Text style={styles.debugTitle}>⚡ Optimized Timings</Text>
+        <Text style={styles.debugTitle}>🔍 Performance</Text>
 
+        {debugInfo.captureTime !== undefined && (
+          <Text style={[styles.debugText, styles.captureTimeText]}>
+            Capture: {debugInfo.captureTime}ms
+          </Text>
+        )}
+        {debugInfo.detectionTime !== undefined && (
+          <Text style={[styles.debugText, styles.detectionTimeText]}>
+            Detect: {debugInfo.detectionTime}ms
+          </Text>
+        )}
         {debugInfo.readTime !== undefined && (
           <Text style={styles.debugText}>Read: {debugInfo.readTime}ms</Text>
-        )}
-        {debugInfo.compressTime !== undefined && (
-          <Text style={styles.debugText}>
-            Compress: {debugInfo.compressTime}ms
-          </Text>
         )}
         {debugInfo.rotateTime !== undefined && (
           <Text style={styles.debugText}>Rotate: {debugInfo.rotateTime}ms</Text>
@@ -1070,9 +1197,29 @@ export default function App() {
         {debugInfo.cropTime !== undefined && (
           <Text style={styles.debugText}>Crop: {debugInfo.cropTime}ms</Text>
         )}
+        {debugInfo.compressTime !== undefined && (
+          <Text style={styles.debugText}>
+            Compress: {debugInfo.compressTime}ms
+          </Text>
+        )}
+        {debugInfo.wsTime !== undefined && (
+          <Text style={[styles.debugText, styles.wsTimeText]}>
+            WS Send: {debugInfo.wsTime}ms
+          </Text>
+        )}
+        {debugInfo.wsResponseTime !== undefined && (
+          <Text style={[styles.debugText, styles.wsResponseTimeText]}>
+            WS Response: {debugInfo.wsResponseTime}ms
+          </Text>
+        )}
         {debugInfo.totalTime !== undefined && (
           <Text style={[styles.debugText, styles.totalTimeText]}>
-            Total: {debugInfo.totalTime}ms
+            Process: {debugInfo.totalTime}ms
+          </Text>
+        )}
+        {debugInfo.grandTotalTime !== undefined && (
+          <Text style={[styles.debugText, styles.grandTotalTimeText]}>
+            TOTAL: {debugInfo.grandTotalTime}ms
           </Text>
         )}
         {debugInfo.compressedSize !== undefined && (
@@ -1083,7 +1230,7 @@ export default function App() {
         {debugInfo.faceCount !== undefined && (
           <Text style={styles.debugText}>Faces: {debugInfo.faceCount}</Text>
         )}
-        <Text style={styles.optimizedLabel}>🚀 Android 11+ Ready</Text>
+        <Text style={styles.optimizedLabel}>📦 Complete Timing</Text>
       </View>
 
       {recognizedCrops.length > 0 && (
@@ -1186,6 +1333,8 @@ const styles = StyleSheet.create({
     zIndex: 10,
     borderRadius: 4,
   },
+
+  // Static Face Detection Box Styles (No Animation)
   faceCorner: {
     position: 'absolute',
     borderColor: '#00FF00',
@@ -1194,41 +1343,101 @@ const styles = StyleSheet.create({
   topLeft: {
     top: 0,
     left: 0,
-    borderTopWidth: 3,
-    borderLeftWidth: 3,
+    borderTopWidth: 4,
+    borderLeftWidth: 4,
+    shadowColor: '#00FF00',
+    shadowOffset: {width: 0, height: 0},
+    shadowOpacity: 0.8,
+    shadowRadius: 3,
+    elevation: 5,
   },
   topRight: {
     top: 0,
     right: 0,
-    borderTopWidth: 3,
-    borderRightWidth: 3,
+    borderTopWidth: 4,
+    borderRightWidth: 4,
+    shadowColor: '#00FF00',
+    shadowOffset: {width: 0, height: 0},
+    shadowOpacity: 0.8,
+    shadowRadius: 3,
+    elevation: 5,
   },
   bottomLeft: {
     bottom: 0,
     left: 0,
-    borderBottomWidth: 3,
-    borderLeftWidth: 3,
+    borderBottomWidth: 4,
+    borderLeftWidth: 4,
+    shadowColor: '#00FF00',
+    shadowOffset: {width: 0, height: 0},
+    shadowOpacity: 0.8,
+    shadowRadius: 3,
+    elevation: 5,
   },
   bottomRight: {
     bottom: 0,
     right: 0,
-    borderBottomWidth: 3,
-    borderRightWidth: 3,
+    borderBottomWidth: 4,
+    borderRightWidth: 4,
+    shadowColor: '#00FF00',
+    shadowOffset: {width: 0, height: 0},
+    shadowOpacity: 0.8,
+    shadowRadius: 3,
+    elevation: 5,
   },
+
+  // Center border for clearer outline
+  faceCenterBorder: {
+    position: 'absolute',
+    top: '25%',
+    left: '25%',
+    right: '25%',
+    bottom: '25%',
+    borderWidth: 1,
+    borderColor: 'rgba(0, 255, 0, 0.3)',
+    borderStyle: 'dashed',
+  },
+
+  // Static face number container (no animation)
   faceNumberContainer: {
     position: 'absolute',
-    top: -25,
+    top: -35,
     left: 0,
-    backgroundColor: 'rgba(0, 255, 0, 0.9)',
-    paddingHorizontal: 8,
-    paddingVertical: 2,
-    borderRadius: 10,
+    backgroundColor: 'rgba(0, 255, 0, 0.95)',
+    paddingHorizontal: 12,
+    paddingVertical: 4,
+    borderRadius: 15,
+    minWidth: 30,
+    alignItems: 'center',
+    shadowColor: '#000',
+    shadowOffset: {width: 0, height: 2},
+    shadowOpacity: 0.8,
+    shadowRadius: 3,
+    elevation: 5,
   },
   faceNumber: {
     color: 'white',
-    fontSize: 12,
+    fontSize: 14,
     fontWeight: 'bold',
   },
+
+  // Face size indicator
+  faceSizeIndicator: {
+    position: 'absolute',
+    bottom: -35,
+    right: 0,
+    backgroundColor: 'rgba(0, 0, 0, 0.8)',
+    paddingHorizontal: 8,
+    paddingVertical: 2,
+    borderRadius: 8,
+    borderWidth: 1,
+    borderColor: '#00FF00',
+  },
+  faceSizeText: {
+    color: '#00FF00',
+    fontSize: 10,
+    fontWeight: '600',
+  },
+
   loadingOverlay: {
     position: 'absolute',
     top: 0,
@@ -1324,6 +1533,32 @@ const styles = StyleSheet.create({
     fontSize: 12,
     lineHeight: 16,
   },
+  captureTimeText: {
+    color: '#ff6600',
+    fontWeight: 'bold',
+    fontSize: 13,
+  },
+  detectionTimeText: {
+    color: '#ffaa00',
+    fontWeight: 'bold',
+    fontSize: 13,
+  },
+  wsTimeText: {
+    color: '#00aaff',
+    fontWeight: 'bold',
+    fontSize: 13,
+  },
+  wsResponseTimeText: {
+    color: '#0088ff',
+    fontWeight: 'bold',
+    fontSize: 13,
+  },
+  grandTotalTimeText: {
+    color: '#ff0066',
+    fontWeight: 'bold',
+    fontSize: 14,
+    textDecorationLine: 'underline',
+  },
   totalTimeText: {
     color: '#00ff00',
     fontWeight: 'bold',
@@ -1366,12 +1601,11 @@ const styles = StyleSheet.create({
     backgroundColor: 'rgba(0,255,0,0.1)',
   },
   cropPreviewImage: {
-    width: 120, // Naikkan dari 80
-    height: 120, // Naikkan dari 80
+    width: 120,
+    height: 75,
     borderRadius: 6,
     backgroundColor: 'rgba(255,255,255,0.1)',
   },
-
   cropPreviewStatus: {
     position: 'absolute',
     top: 2,
